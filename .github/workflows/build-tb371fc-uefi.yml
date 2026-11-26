@@ -1,0 +1,159 @@
+name: Build TB371FC UEFI Firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: EDK II build target
+        type: choice
+        options:
+          - DEBUG
+          - RELEASE
+        default: DEBUG
+
+permissions:
+  contents: read
+
+jobs:
+  build-tb371fc-uefi:
+    name: Build TB371FC UEFI (SILICIUM_UEFI.fd + BootShim)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout uefi-tb371fc
+        uses: actions/checkout@v4
+        with:
+          path: uefi
+          persist-credentials: false
+
+      - name: Initialize required Mu submodules
+        run: |
+          git -C uefi submodule update --init --depth 1 Common/Mu Common/Mu_OEM_Sample
+
+      - name: Checkout upstream UniXNU core and DarwinBoot
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: main
+          path: unixnu
+          persist-credentials: false
+
+      - name: Initialize DarwinBoot submodule
+        run: |
+          git -C unixnu submodule update --init --depth 1 drivers/DarwinBoot
+
+      - name: Optionally apply diagnostic menu-hold patch
+        id: menu_patch
+        run: |
+          if git -C unixnu apply --check "$PWD/uefi/Resources/UniXNUPatches/j716f-menu-hold.patch"; then
+            git -C unixnu apply "$PWD/uefi/Resources/UniXNUPatches/j716f-menu-hold.patch"
+            echo "applied=1" >> "$GITHUB_OUTPUT"
+            echo "Applied diagnostic menu-hold patch"
+          else
+            echo "applied=0" >> "$GITHUB_OUTPUT"
+            echo "Menu-hold patch did not apply cleanly against current upstream; continuing with standard menu"
+          fi
+
+      - name: Checkout pinned mu_basecore (edk2 feed)
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          feeds = tomllib.loads(Path('unixnu/feeds.toml').read_text())
+          edk2 = next(src for src in feeds['source'] if src['name'] == 'edk2')
+          dest = Path('edk2')
+          subprocess.run(['git', 'init', str(dest)], check=True)
+          subprocess.run(['git', '-C', str(dest), 'remote', 'add', 'origin', edk2['git']], check=True)
+          subprocess.run(['git', '-C', str(dest), 'fetch', '--depth', '1', 'origin', edk2['commit']], check=True)
+          subprocess.run(['git', '-C', str(dest), 'checkout', '--detach', 'FETCH_HEAD'], check=True)
+          submodules = edk2.get('submodules', [])
+          if submodules:
+              subprocess.run(
+                  ['git', '-C', str(dest), 'submodule', 'update', '--init', '--depth', '1', '--', *submodules],
+                  check=True,
+              )
+          PY
+
+      - name: Install EDK II build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang-18 lld-18 llvm-18 nasm acpica-tools uuid-dev
+
+      - name: Build EDK II BaseTools
+        run: |
+          make -C "$PWD/edk2/BaseTools/Source/C" -j"$(nproc)"
+
+      - name: Compile SILICIUM_UEFI.fd and BootShim
+        env:
+          BUILD_TARGET: ${{ inputs.build_target || 'DEBUG' }}
+          MENU_PATCH_APPLIED: ${{ steps.menu_patch.outputs.applied }}
+        run: |
+          set -euo pipefail
+          UEFI="$PWD/uefi"
+          EDK2="$PWD/edk2"
+          UNIXNU="$PWD/unixnu"
+          CONF="$PWD/edk2-conf"
+          OUT="$PWD/artifacts"
+          mkdir -p "$CONF" "$OUT"
+          for name in target tools_def build_rule; do
+            cp "$EDK2/BaseTools/Conf/${name}.template" "$CONF/${name}.txt"
+          done
+
+          export WORKSPACE="$UEFI"
+          export EDK_TOOLS_PATH="$EDK2/BaseTools"
+          export CONF_PATH="$CONF"
+          export CLANG_BIN="/usr/lib/llvm-18/bin/"
+          export PYTHON_COMMAND="python3"
+          export SOURCE_DATE_EPOCH="$(git -C "$UEFI" log -1 --format=%ct)"
+          export PATH="$EDK_TOOLS_PATH/BinWrappers/PosixLike:$EDK_TOOLS_PATH/Source/C/bin:$PATH"
+          export PACKAGES_PATH="$UEFI:$UEFI/Platforms/Lenovo:$UEFI/Common/Mu:$UEFI/Common/Mu_OEM_Sample:$EDK2:$UEFI/Silicon/Qualcomm:$UEFI/Silicon/Silicium:$UNIXNU/package:$UNIXNU/drivers/DarwinBoot"
+
+          EXTRA_DEFINES=()
+          if [ "$MENU_PATCH_APPLIED" = "1" ]; then
+            EXTRA_DEFINES+=(-D J716F_MENU_DIAGNOSTIC=1)
+          fi
+
+          cd "$UEFI"
+          build \
+            -p Platforms/Lenovo/j716fPkg/j716f.dsc \
+            -a AARCH64 \
+            -b "$BUILD_TARGET" \
+            -t CLANGPDB \
+            -n "$(nproc)" \
+            -D FD_BASE=0xCE000000 \
+            -D FD_SIZE=0x700000 \
+            -D FD_BLOCKS=1792 \
+            -D DEVICE_MODEL=tb371fc \
+            -D ENABLE_SECUREBOOT=0 \
+            "${EXTRA_DEFINES[@]}"
+
+          FD="$UEFI/Build/j716fPkg/${BUILD_TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+          SIZE="$(stat -c %s "$FD")"
+          echo "Built $FD ($SIZE bytes)"
+          test "$SIZE" -eq 7340032
+
+          make -C "$UEFI/BootShim" \
+            CC=clang-18 \
+            OBJCOPY=llvm-objcopy-18 \
+            REQUIRES_KERNEL_HEADER=1 \
+            FD_BASE=0xCE000000 \
+            FD_SIZE=0x700000
+
+          cp "$FD" "$OUT/SILICIUM_UEFI.fd"
+          cp "$UEFI/BootShim/BootShim.bin" "$OUT/BootShim.bin"
+          cat "$UEFI/BootShim/BootShim.bin" "$FD" > "$OUT/uefi-tb371fc-kernel.bin"
+          gzip -9 -c "$OUT/uefi-tb371fc-kernel.bin" > "$OUT/uefi-tb371fc-kernel.gz"
+          sha256sum "$OUT"/* > "$OUT/SHA256SUMS.txt"
+          cat "$OUT/SHA256SUMS.txt"
+
+      - name: Upload TB371FC UEFI Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uefi-tb371fc-${{ inputs.build_target || 'DEBUG' }}
+          path: artifacts/*
+          retention-days: 14
